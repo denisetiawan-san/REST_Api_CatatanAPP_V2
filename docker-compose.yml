@@ -1,0 +1,155 @@
+services:
+# → services = blok utama yang mendefinisikan semua container yang akan dijalankan
+# → setiap item di bawah services adalah satu container
+
+  mysql:
+  # → nama service "mysql" — nama ini dipakai sebagai hostname internal di Docker network
+  # → container lain bisa resolve "mysql" sebagai hostname untuk koneksi ke container ini
+
+    image: mysql:8.0
+    # → gunakan image resmi MySQL versi 8.0 dari Docker Hub
+    # → kalau image belum ada di lokal, Docker otomatis pull saat pertama kali dijalankan
+
+    container_name: catatan_mysql
+    # → nama container yang tampil di "docker ps" dan docker logs
+    # → tanpa ini Docker generate nama random seperti "project_mysql_1"
+
+    restart: unless-stopped
+    # → container otomatis restart kalau mati karena crash atau error
+    # → "unless-stopped" = restart terus kecuali kamu yang sengaja stop manual via docker stop
+
+    environment:
+    # → set environment variable di dalam container MySQL
+      MYSQL_ROOT_PASSWORD: MYSQL_ROOT_PASSWORD
+      # → password untuk user root MySQL
+      # → wajib ada — MySQL tidak mau start tanpa ini
+      MYSQL_DATABASE: catatan_app
+      # → buat database bernama "catatan_app" otomatis saat container pertama kali dibuat
+      # → tanpa ini kamu harus buat database manual setelah container jalan
+
+    ports:
+      - "3306:3306"
+      # → format: "HOST_PORT:CONTAINER_PORT"
+      # → expose port 3306 di dalam container ke port 3306 di mesin host
+      # → memungkinkan koneksi dari luar Docker, misal dari MySQL Workbench di laptop kamu
+      # → kalau tidak perlu akses dari luar, baris ini bisa dihapus untuk keamanan
+
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # → mount named volume "mysql_data" ke path /var/lib/mysql di dalam container
+      # → /var/lib/mysql adalah tempat MySQL menyimpan semua data database
+      # → dengan named volume: data tetap ada meskipun container dihapus dan dibuat ulang
+      # → tanpa ini: semua data hilang setiap kali container di-recreate
+
+      - ./database/catatan.sql:/docker-entrypoint-initdb.d/catatan.sql
+      # → mount file SQL lokal ke folder khusus di dalam container MySQL
+      # → /docker-entrypoint-initdb.d/ = folder ajaib MySQL yang dieksekusi otomatis
+      # → semua file .sql di folder ini dijalankan saat container PERTAMA KALI dibuat
+      # → hanya berjalan sekali — kalau volume sudah ada, tidak dijalankan lagi
+      # → hasilnya: tabel catatan dan users langsung terbuat tanpa perlu import manual
+
+    healthcheck:
+    # → definisikan cara Docker mengecek apakah MySQL sudah benar-benar siap
+    # → "container jalan" ≠ "MySQL siap terima koneksi" — MySQL butuh beberapa detik untuk init
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p{YOUR_PASSWORD}"]
+      # → perintah yang dijalankan untuk cek kesehatan container
+      # → mysqladmin ping = kirim ping ke MySQL server
+      # → -h localhost = ping ke MySQL di host localhost (dalam container itu sendiri)
+      # → -p{YOUR_PASSORD} = gunakan password ini untuk auth
+      # → kalau MySQL sudah siap: command return exit code 0 → status healthy
+      # → kalau MySQL belum siap: command return exit code 1 → status unhealthy
+      interval: 10s
+      # → jalankan healthcheck setiap 10 detik
+      timeout: 5s
+      # → kalau healthcheck tidak selesai dalam 5 detik → dianggap gagal
+      retries: 5
+      # → kalau gagal 5 kali berturut-turut → container dianggap unhealthy
+      # → total waktu tunggu maksimal: 10s x 5 = 50 detik sebelum dianggap unhealthy
+
+  app:
+  # → nama service "app" — nama ini yang dipakai di nginx.conf sebagai proxy_pass http://app:8080
+
+    build: .
+    # → build image dari Dockerfile yang ada di direktori saat ini (titik = current directory)
+    # → berbeda dengan "image:" yang pull dari Docker Hub — ini build dari source code lokal
+    # → jalankan dengan "docker compose up --build" agar image di-rebuild setiap ada perubahan code
+
+    container_name: catatan_app
+    # → nama container yang tampil di docker ps
+
+    restart: unless-stopped
+    # → sama seperti MySQL — restart otomatis kalau crash, kecuali di-stop manual
+
+    env_file:
+      - .env
+      # → baca semua environment variable dari file .env dan inject ke dalam container
+      # → ini yang membuat os.Getenv() di Go app bisa baca DB_DSN, JWT_SECRET, dll
+      # → lebih bersih dari mendaftarkan satu per satu di bawah "environment:"
+
+    ports:
+      - "8080:8080"
+      # → expose port 8080 container ke port 8080 host
+      # → memungkinkan akses langsung ke Go app tanpa lewat Nginx, misal untuk debugging
+      # → di production sebaiknya dihapus — semua traffic harus lewat Nginx di port 80
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+        # → Go app tidak akan start sebelum MySQL berstatus healthy
+        # → "healthy" = healthcheck MySQL berhasil (mysqladmin ping sukses)
+        # → ini bedanya dengan depends_on biasa yang hanya tunggu container jalan
+        # → tanpa condition ini: Go app bisa start saat MySQL masih inisialisasi → koneksi gagal → app crash
+
+  nginx:
+  # → nama service "nginx" — layer pertama yang menerima semua request dari luar
+
+    image: nginx:alpine
+    # → gunakan image Nginx versi alpine — lebih ringan dari image Nginx standar
+    # → alpine = distro Linux minimal, ukuran image jauh lebih kecil
+
+    container_name: catatan_nginx
+    # → nama container yang tampil di docker ps
+
+    restart: unless-stopped
+    # → restart otomatis kalau Nginx crash
+
+    ports:
+      - "80:80"
+      # → expose port 80 container ke port 80 host
+      # → port 80 adalah port HTTP standar yang diakses browser
+      # → semua request dari luar masuk lewat sini dulu sebelum diteruskan ke Go app
+
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # → mount file nginx.conf lokal ke path konfigurasi Nginx di dalam container
+      # → /etc/nginx/nginx.conf = lokasi default Nginx membaca konfigurasi
+      # → :ro = read-only, container Nginx tidak bisa mengubah file konfigurasi ini
+      # → kalau nginx.conf diubah: perlu "docker compose restart nginx" agar perubahan aktif
+
+    depends_on:
+      - app
+      # → Nginx tidak akan start sebelum container app jalan
+      # → tanpa healthcheck di sini karena Nginx bisa retry proxy_pass kalau app belum siap
+      # → berbeda dengan app yang butuh condition: service_healthy karena Go app crash kalau DB belum ready
+
+volumes:
+  mysql_data:
+  # → deklarasi named volume "mysql_data"
+  # → harus dideklarasikan di sini agar Docker tahu ini adalah named volume yang dikelola Docker
+  # → Docker simpan data ini di /var/lib/docker/volumes/mysql_data/_data di mesin host
+  # → berbeda dengan bind mount (./folder:path) yang langsung ke folder di mesin host
+  # → keuntungan named volume: dikelola Docker, portable, dan tidak bergantung struktur folder host
+
+
+# Penjelasan Penting
+# depends_on dengan condition: service_healthy:
+# Go app tidak akan start sebelum MySQL benar-benar siap menerima koneksi — 
+# bukan hanya container-nya jalan, tapi MySQL-nya sendiri sudah ready. Ini mencegah error koneksi database saat startup.
+
+# volumes di MySQL:
+# yaml- mysql_data:/var/lib/mysql
+
+# Data MySQL disimpan di named volume — kalau container dihapus dan dibuat ulang, data tidak hilang.
+
+# yaml- ./database/catatan.sql:/docker-entrypoint-initdb.d/catatan.sql
+# SQL file kamu otomatis dijalankan saat MySQL container pertama kali dibuat — tabel catatan dan users langsung terbuat.
